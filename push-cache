@@ -1,0 +1,78 @@
+#!/bin/bash
+
+datetime () { date +"%Y-%m-%d %H:%M:%S"; }
+
+[[ -t 1 ]] && interm=yes
+
+red ()    { [[ "$interm" = "yes" ]] && echo "\e[1;31m$1\e[m" || echo "$1"; }
+yellow () { [[ "$interm" = "yes" ]] && echo "\e[1;33m$1\e[m" || echo "$1"; }
+log () { printf "$(yellow "[log $(datetime)]") $1\n"; }
+err () { printf "$(red "[error $(datetime)]") $1\n"; exit 1; }
+
+usage () {
+    echo "usage: push-cache source cache"
+    echo ""
+    echo "where:"
+    echo "  source:  the image to push to cache - either the build path or a squashfs image"
+    echo "  cache:   the location of the cache"
+    echo ""
+    [[ "" == "$1" ]] && exit 0
+    err "$1"
+}
+
+# Tool for pushing the contents of an stack to an image.
+#
+#
+# Todo: arguments for parameterisation
+#   1. The path of the build cache
+#       - optionally create it and the key if it does not exist or if requested
+#   2. The mount_path of the image
+#   3. (optional): the store_path
+#       - needed for incomplete builds that have to be mounted at mount_path with bwrap
+#   4. working directory
+#       - this could be generated in /tmp
+
+source_path="$1"
+build_cache_path="$2"
+
+store_path="/dev/shm/bcumming/v1/store"
+mount_path="/user-environment"
+
+key_path="$build_cache_path/spack-push-key.gpg"
+
+local_config="${PWD}/config"
+export SPACK_SYSTEM_CONFIG_PATH="$mount_path/config"
+export SPACK_USER_CONFIG_PATH="$local_config"
+
+# Clone spack and checkout relevant version
+# This spack will be use the stack as upstream and perform the
+# push to the cache.
+# todo:
+#   - if using a fully installed tree we could grab the spack version from
+#     from the image
+#   - support two workflows
+#       1. a partially built image that needs to be mounted through bwrap
+#       2. a complete image that has been mounted at /user-environment
+git clone "https://github.com/spack/spack.git"
+
+spack_version=a8b1314d188149e696eb8e7ba3e4d0de548f1894
+(cd spack; git checkout $spack_version;)
+
+source "spack/share/spack/setup-env.sh"
+
+# Configure the local spack configuration that points to the upstream
+# and the mirror.yaml for the spack cache.
+mkdir "$local_config";
+echo "upstreams:
+  spack-instance-1:
+    install_tree: ${mount_path}" > "$local_config/upstreams.txt"
+
+spack -C "$local_config" mirror add url "$build_cache_path"
+
+# TODO: SANDBOX is a no-op if the image has already been mounted
+export SANDBOX=./bwrap-mutable-root.sh --bind ${store_path} ${mount_path}
+
+hashes=$($SANDBOX spack find --format '/${hash}')
+$SANDBOX spack buildcache keys --install --trust
+$SANDBOX spack gpg trust ${key_path}
+$SANDBOX spack buildcache create --rebuild-index --allow-root --only=package -m alpscache ${hashes}
